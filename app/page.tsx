@@ -1,15 +1,38 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 import type { User } from "@supabase/supabase-js";
 import { supabase } from "../lib/supabase";
 
 type Screen = "home" | "login" | "register";
+
 type Profile = {
   id: string;
   username: string | null;
   created_at: string;
+};
+
+type Season = {
+  id: string;
+  name: string;
+  created_by: string;
+  max_players: number;
+  status: string;
+  current_turn: number;
+  created_at: string;
+};
+
+type SeasonPlayer = {
+  season_id: string;
+  player_id: string;
+};
+
+const statusNames: Record<string, string> = {
+  open: "Registration Open",
+  active: "In Progress",
+  paused: "Paused",
+  finished: "Finished",
 };
 
 export default function Home() {
@@ -26,6 +49,13 @@ export default function Home() {
   const [checking, setChecking] = useState(true);
   const [editingUsername, setEditingUsername] = useState(false);
 
+  const [seasons, setSeasons] = useState<Season[]>([]);
+  const [seasonPlayers, setSeasonPlayers] = useState<SeasonPlayer[]>([]);
+  const [seasonName, setSeasonName] = useState("");
+  const [maxPlayers, setMaxPlayers] = useState(30);
+  const [showCreateSeason, setShowCreateSeason] = useState(false);
+  const [seasonsLoading, setSeasonsLoading] = useState(false);
+
   useEffect(() => {
     let active = true;
 
@@ -34,9 +64,7 @@ export default function Home() {
 
       if (!active) return;
 
-      if (error) {
-        setMessage(error.message);
-      }
+      if (error) setMessage(error.message);
 
       setUser(data.user);
       setChecking(false);
@@ -53,6 +81,8 @@ export default function Home() {
         if (!session?.user) {
           setProfile(null);
           setUsername("");
+          setSeasons([]);
+          setSeasonPlayers([]);
         }
       }
     );
@@ -96,9 +126,47 @@ export default function Home() {
     };
   }, [user?.id]);
 
+  const loadSeasons = useCallback(async () => {
+    if (!user) return;
+
+    setSeasonsLoading(true);
+
+    const [seasonsResult, playersResult] = await Promise.all([
+      supabase
+        .from("seasons")
+        .select(
+          "id, name, created_by, max_players, status, current_turn, created_at"
+        )
+        .order("created_at", { ascending: false }),
+
+      supabase
+        .from("season_players")
+        .select("season_id, player_id"),
+    ]);
+
+    if (seasonsResult.error) {
+      setMessage("Season error: " + seasonsResult.error.message);
+    } else {
+      setSeasons(seasonsResult.data ?? []);
+    }
+
+    if (playersResult.error) {
+      setMessage("Players error: " + playersResult.error.message);
+    } else {
+      setSeasonPlayers(playersResult.data ?? []);
+    }
+
+    setSeasonsLoading(false);
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (user && profile?.username) {
+      void loadSeasons();
+    }
+  }, [user?.id, profile?.username, loadSeasons]);
+
   async function handleAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
     setLoading(true);
     setMessage("");
 
@@ -168,16 +236,94 @@ export default function Home() {
       .single();
 
     if (error) {
-      if (error.code === "23505") {
-        setMessage("This username is already taken. Try another.");
-      } else {
-        setMessage("Could not save username: " + error.message);
-      }
+      setMessage(
+        error.code === "23505"
+          ? "This username is already taken."
+          : "Could not save username: " + error.message
+      );
     } else {
       setProfile(data);
       setUsername(data.username ?? "");
       setEditingUsername(false);
       setMessage("Username saved successfully!");
+    }
+
+    setLoading(false);
+  }
+
+  async function createSeason(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!user || !profile?.username) return;
+
+    setLoading(true);
+    setMessage("");
+
+    const { error } = await supabase.rpc("create_season", {
+      p_name: seasonName.trim(),
+      p_max_players: maxPlayers,
+    });
+
+    if (error) {
+      setMessage("Could not create season: " + error.message);
+    } else {
+      setSeasonName("");
+      setShowCreateSeason(false);
+      setMessage("Your season has been created!");
+      await loadSeasons();
+    }
+
+    setLoading(false);
+  }
+
+  async function joinSeason(seasonId: string) {
+    if (!user) return;
+
+    setLoading(true);
+    setMessage("");
+
+    const { error } = await supabase.rpc("join_season", {
+      p_season_id: seasonId,
+    });
+
+    if (error) {
+      setMessage("Could not join season: " + error.message);
+    } else {
+      setMessage("You have joined the season!");
+      await loadSeasons();
+    }
+
+    setLoading(false);
+  }
+
+  async function manageSeason(
+    seasonId: string,
+    action: "start" | "pause" | "resume" | "finish"
+  ) {
+    if (!user) return;
+
+    if (
+      action === "finish" &&
+      !window.confirm(
+        "Are you sure you want to end this season? This cannot be undone."
+      )
+    ) {
+      return;
+    }
+
+    setLoading(true);
+    setMessage("");
+
+    const { error } = await supabase.rpc("manage_season", {
+      p_season_id: seasonId,
+      p_action: action,
+    });
+
+    if (error) {
+      setMessage("Could not manage season: " + error.message);
+    } else {
+      setMessage("Season updated successfully!");
+      await loadSeasons();
     }
 
     setLoading(false);
@@ -196,7 +342,8 @@ export default function Home() {
       setProfile(null);
       setScreen("home");
       setUsername("");
-      setEditingUsername(false);
+      setSeasons([]);
+      setSeasonPlayers([]);
       setMessage("You have logged out.");
     }
 
@@ -209,10 +356,24 @@ export default function Home() {
     setPassword("");
   }
 
+  function playerCount(seasonId: string) {
+    return seasonPlayers.filter(
+      (player) => player.season_id === seasonId
+    ).length;
+  }
+
+  function hasJoined(seasonId: string) {
+    return seasonPlayers.some(
+      (player) =>
+        player.season_id === seasonId &&
+        player.player_id === user?.id
+    );
+  }
+
   return (
     <main style={mainStyle}>
-      <div style={{ width: "100%", maxWidth: 650, textAlign: "center" }}>
-        <div style={{ fontSize: 62, marginBottom: 12 }}>♛</div>
+      <div style={{ width: "100%", maxWidth: 850, textAlign: "center" }}>
+        <div style={{ fontSize: 58, marginBottom: 8 }}>♛</div>
 
         <div style={subtitleStyle}>THE AGE OF KINGDOMS</div>
 
@@ -229,127 +390,350 @@ export default function Home() {
         {checking ? (
           <p>Checking your account...</p>
         ) : user ? (
-          <div style={panelStyle}>
-            <h2 style={{ color: "#e0bd79" }}>
-              Welcome, Ruler!
-            </h2>
+          <>
+            <div style={panelStyle}>
+              <h2 style={{ color: "#e0bd79" }}>
+                Welcome, Ruler!
+              </h2>
 
-            <p style={{ color: "#aab8a8" }}>
-              Your player account
-            </p>
+              <p style={{ color: "#aab8a8" }}>
+                Your player account
+              </p>
 
-            <p style={{ overflowWrap: "anywhere" }}>
-              {user.email}
-            </p>
+              <p style={{ overflowWrap: "anywhere" }}>
+                {user.email}
+              </p>
 
-            {profile?.username && !editingUsername ? (
-              <div style={usernameCardStyle}>
-                <p style={{ color: "#c6a76d", marginBottom: 8 }}>
-                  YOUR USERNAME
-                </p>
+              {profile?.username && !editingUsername ? (
+                <div style={usernameCardStyle}>
+                  <p style={{ color: "#c6a76d", marginBottom: 8 }}>
+                    YOUR USERNAME
+                  </p>
 
-                <h2 style={{ marginTop: 0 }}>
-                  ♛ {profile.username}
-                </h2>
-
-                <button
-                  style={{ ...buttonDark, width: "100%" }}
-                  onClick={() => {
-                    setEditingUsername(true);
-                    setMessage("");
-                  }}
-                >
-                  Change Username
-                </button>
-              </div>
-            ) : (
-              <div style={usernameCardStyle}>
-                <h3>
-                  {profile?.username
-                    ? "Change Username"
-                    : "Choose Your Username"}
-                </h3>
-
-                <p style={{ color: "#aab8a8", fontSize: 14 }}>
-                  Choose a unique name for your kingdom adventures.
-                </p>
-
-                <form onSubmit={saveUsername}>
-                  <input
-                    type="text"
-                    required
-                    minLength={3}
-                    maxLength={20}
-                    pattern="[A-Za-z0-9_]{3,20}"
-                    title="3-20 letters, numbers or underscores"
-                    placeholder="Example: KingMaikls"
-                    value={username}
-                    onChange={(event) =>
-                      setUsername(event.target.value)
-                    }
-                    style={inputStyle}
-                  />
+                  <h2 style={{ marginTop: 0 }}>
+                    ♛ {profile.username}
+                  </h2>
 
                   <button
-                    type="submit"
-                    disabled={loading}
-                    style={{
-                      ...buttonGold,
-                      width: "100%",
-                      marginTop: 14,
-                    }}
-                  >
-                    {loading ? "Saving..." : "Save Username"}
-                  </button>
-                </form>
-
-                {profile?.username && editingUsername && (
-                  <button
-                    style={{
-                      ...buttonDark,
-                      width: "100%",
-                      marginTop: 12,
-                    }}
+                    style={{ ...buttonDark, width: "100%" }}
                     onClick={() => {
-                      setUsername(profile.username ?? "");
-                      setEditingUsername(false);
+                      setEditingUsername(true);
+                      setMessage("");
                     }}
                   >
-                    Cancel
+                    Change Username
                   </button>
-                )}
-              </div>
-            )}
+                </div>
+              ) : (
+                <div style={usernameCardStyle}>
+                  <h3>
+                    {profile?.username
+                      ? "Change Username"
+                      : "Choose Your Username"}
+                  </h3>
 
-            {profile?.username && !editingUsername && (
+                  <form onSubmit={saveUsername}>
+                    <input
+                      type="text"
+                      required
+                      minLength={3}
+                      maxLength={20}
+                      pattern="[A-Za-z0-9_]{3,20}"
+                      placeholder="Example: KingMaikls"
+                      value={username}
+                      onChange={(event) =>
+                        setUsername(event.target.value)
+                      }
+                      style={inputStyle}
+                    />
+
+                    <button
+                      type="submit"
+                      disabled={loading}
+                      style={{
+                        ...buttonGold,
+                        width: "100%",
+                        marginTop: 14,
+                      }}
+                    >
+                      {loading ? "Saving..." : "Save Username"}
+                    </button>
+                  </form>
+
+                  {profile?.username && editingUsername && (
+                    <button
+                      style={{
+                        ...buttonDark,
+                        width: "100%",
+                        marginTop: 12,
+                      }}
+                      onClick={() => {
+                        setUsername(profile.username ?? "");
+                        setEditingUsername(false);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              )}
+
               <button
                 style={{
-                  ...buttonGold,
+                  ...buttonDark,
                   width: "100%",
-                  marginTop: 16,
+                  marginTop: 14,
                 }}
-                onClick={() =>
-                  setMessage(
-                    "The kingdom and season system is coming next!"
-                  )
-                }
+                disabled={loading}
+                onClick={handleLogout}
               >
-                ⚔ Play Game
+                Logout
               </button>
-            )}
+            </div>
 
-            <button
-              style={{
-                ...buttonDark,
-                width: "100%",
-                marginTop: 12,
-              }}
-              disabled={loading}
-              onClick={handleLogout}
-            >
-              Logout
-            </button>
-          </div>
+            {profile?.username && (
+              <section style={{ marginTop: 35 }}>
+                <h2 style={{ color: "#e0bd79", fontSize: 30 }}>
+                  ⚔ Multiplayer Seasons
+                </h2>
+
+                <p style={{ color: "#aab8a8" }}>
+                  Create a kingdom season or join other rulers.
+                </p>
+
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "center",
+                    gap: 12,
+                    flexWrap: "wrap",
+                    marginBottom: 24,
+                  }}
+                >
+                  <button
+                    style={buttonGold}
+                    onClick={() =>
+                      setShowCreateSeason(!showCreateSeason)
+                    }
+                  >
+                    + Create Season
+                  </button>
+
+                  <button
+                    style={buttonDark}
+                    disabled={seasonsLoading}
+                    onClick={() => void loadSeasons()}
+                  >
+                    {seasonsLoading ? "Loading..." : "↻ Refresh"}
+                  </button>
+                </div>
+
+                {showCreateSeason && (
+                  <div style={seasonFormStyle}>
+                    <h3>Create New Season</h3>
+
+                    <form onSubmit={createSeason}>
+                      <input
+                        type="text"
+                        required
+                        minLength={3}
+                        maxLength={60}
+                        placeholder="Season name"
+                        value={seasonName}
+                        onChange={(event) =>
+                          setSeasonName(event.target.value)
+                        }
+                        style={inputStyle}
+                      />
+
+                      <p style={{ color: "#c6a76d" }}>
+                        Maximum Players
+                      </p>
+
+                      <select
+                        value={maxPlayers}
+                        onChange={(event) =>
+                          setMaxPlayers(Number(event.target.value))
+                        }
+                        style={inputStyle}
+                      >
+                        {[10, 15, 20, 25, 30].map((number) => (
+                          <option key={number} value={number}>
+                            {number} Players
+                          </option>
+                        ))}
+                      </select>
+
+                      <button
+                        type="submit"
+                        disabled={loading}
+                        style={{
+                          ...buttonGold,
+                          width: "100%",
+                          marginTop: 16,
+                        }}
+                      >
+                        {loading ? "Creating..." : "Create Season"}
+                      </button>
+                    </form>
+                  </div>
+                )}
+
+                {seasons.length === 0 ? (
+                  <div style={seasonCardStyle}>
+                    <p>No seasons available yet.</p>
+                    <p style={{ color: "#aab8a8" }}>
+                      Be the first ruler to create one!
+                    </p>
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gap: 16 }}>
+                    {seasons.map((season) => {
+                      const count = playerCount(season.id);
+                      const joined = hasJoined(season.id);
+                      const owner = season.created_by === user.id;
+                      const full = count >= season.max_players;
+
+                      return (
+                        <div key={season.id} style={seasonCardStyle}>
+                          <h3
+                            style={{
+                              color: "#e0bd79",
+                              fontSize: 23,
+                              marginTop: 0,
+                            }}
+                          >
+                            ♛ {season.name}
+                          </h3>
+
+                          <p style={{ color: "#aab8a8" }}>
+                            {statusNames[season.status] ??
+                              season.status}
+                          </p>
+
+                          <p style={{ fontSize: 20 }}>
+                            👥 {count} / {season.max_players} Players
+                          </p>
+
+                          {season.status !== "open" && (
+                            <p>Turn: {season.current_turn}</p>
+                          )}
+
+                          {owner && (
+                            <p style={{ color: "#e0bd79" }}>
+                              ★ You are the Season Administrator
+                            </p>
+                          )}
+
+                          {joined && !owner && (
+                            <p style={{ color: "#a9d4a2" }}>
+                              ✓ You joined this season
+                            </p>
+                          )}
+
+                          {!joined &&
+                            season.status === "open" &&
+                            !full && (
+                              <button
+                                style={buttonGold}
+                                disabled={loading}
+                                onClick={() =>
+                                  void joinSeason(season.id)
+                                }
+                              >
+                                Join Season
+                              </button>
+                            )}
+
+                          {!joined &&
+                            season.status === "open" &&
+                            full && (
+                              <p style={{ color: "#c6a76d" }}>
+                                Season is full
+                              </p>
+                            )}
+
+                          {owner && season.status === "open" && (
+                            <div style={actionRowStyle}>
+                              <button
+                                style={buttonGold}
+                                disabled={loading || count < 10}
+                                onClick={() =>
+                                  void manageSeason(season.id, "start")
+                                }
+                              >
+                                Start Season
+                              </button>
+
+                              {count < 10 && (
+                                <p style={{ color: "#aab8a8", fontSize: 13 }}>
+                                  At least 10 players are required to start.
+                                </p>
+                              )}
+                            </div>
+                          )}
+
+                          {owner && season.status === "active" && (
+                            <div style={actionRowStyle}>
+                              <button
+                                style={buttonDark}
+                                disabled={loading}
+                                onClick={() =>
+                                  void manageSeason(season.id, "pause")
+                                }
+                              >
+                                Pause Season
+                              </button>
+
+                              <button
+                                style={buttonDark}
+                                disabled={loading}
+                                onClick={() =>
+                                  void manageSeason(season.id, "finish")
+                                }
+                              >
+                                End Season
+                              </button>
+                            </div>
+                          )}
+
+                          {owner && season.status === "paused" && (
+                            <div style={actionRowStyle}>
+                              <button
+                                style={buttonGold}
+                                disabled={loading}
+                                onClick={() =>
+                                  void manageSeason(season.id, "resume")
+                                }
+                              >
+                                Resume Season
+                              </button>
+
+                              <button
+                                style={buttonDark}
+                                disabled={loading}
+                                onClick={() =>
+                                  void manageSeason(season.id, "finish")
+                                }
+                              >
+                                End Season
+                              </button>
+                            </div>
+                          )}
+
+                          {season.status === "finished" && (
+                            <p style={{ color: "#aab8a8" }}>
+                              This season has ended.
+                            </p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
+          </>
         ) : screen === "home" ? (
           <div style={homeButtonsStyle}>
             <button
@@ -376,9 +760,7 @@ export default function Home() {
         ) : (
           <div style={panelStyle}>
             <h2>
-              {screen === "login"
-                ? "Login"
-                : "Create Account"}
+              {screen === "login" ? "Login" : "Create Account"}
             </h2>
 
             <form onSubmit={handleAuth}>
@@ -388,9 +770,7 @@ export default function Home() {
                 autoComplete="email"
                 placeholder="Email"
                 value={email}
-                onChange={(event) =>
-                  setEmail(event.target.value)
-                }
+                onChange={(event) => setEmail(event.target.value)}
                 style={inputStyle}
               />
 
@@ -405,9 +785,7 @@ export default function Home() {
                 }
                 placeholder="Password"
                 value={password}
-                onChange={(event) =>
-                  setPassword(event.target.value)
-                }
+                onChange={(event) => setPassword(event.target.value)}
                 style={inputStyle}
               />
 
@@ -511,6 +889,30 @@ const usernameCardStyle: CSSProperties = {
   background: "#1b2a22",
 };
 
+const seasonFormStyle: CSSProperties = {
+  maxWidth: 420,
+  margin: "0 auto 24px",
+  padding: 22,
+  background: "#14241b",
+  border: "1px solid #a77935",
+  borderRadius: 10,
+};
+
+const seasonCardStyle: CSSProperties = {
+  padding: 24,
+  background: "#14241b",
+  border: "1px solid #78613b",
+  borderRadius: 10,
+};
+
+const actionRowStyle: CSSProperties = {
+  display: "flex",
+  justifyContent: "center",
+  gap: 12,
+  flexWrap: "wrap",
+  marginTop: 18,
+};
+
 const homeButtonsStyle: CSSProperties = {
   display: "grid",
   gap: 14,
@@ -519,8 +921,7 @@ const homeButtonsStyle: CSSProperties = {
 };
 
 const buttonGold: CSSProperties = {
-  background:
-    "linear-gradient(135deg, #e0bd79, #a77935)",
+  background: "linear-gradient(135deg, #e0bd79, #a77935)",
   border: "1px solid #e9ce91",
   color: "#211b12",
   padding: "16px 24px",
