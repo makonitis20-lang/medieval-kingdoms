@@ -1,15 +1,47 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import type { CSSProperties, WheelEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  CSSProperties,
+  PointerEvent as ReactPointerEvent,
+  WheelEvent,
+} from "react";
+import { supabase } from "../../lib/supabase";
 import {
   generateWorld,
   type GeneratedProvince,
   type GeneratedWorld,
+  type Point,
   type Terrain,
 } from "../../lib/worldGenerator";
 
-const TERRAIN_COLORS: Record<Terrain, string> = {
+type Season = {
+  id: string;
+  name: string;
+  created_by: string;
+  status: string;
+};
+
+type SeasonWorld = {
+  season_id: string;
+  generation_seed: number;
+  map_width: number;
+  map_height: number;
+  is_generated: boolean;
+};
+
+type DatabaseProvince = {
+  province_number: number;
+  name: string;
+  terrain: Terrain;
+  center_x: number;
+  center_y: number;
+  polygon: Point[];
+};
+
+type MapMode = "season" | "preview";
+
+const COLORS: Record<Terrain, string> = {
   plains: "#a6b87b",
   forest: "#477b57",
   hills: "#b4a06c",
@@ -25,33 +57,42 @@ const TERRAIN_NAMES: Record<Terrain, string> = {
   swamp: "Swamp",
 };
 
-const MAP_WIDTH = 1200;
-const MAP_HEIGHT = 800;
+const DEFAULT_WIDTH = 1200;
+const DEFAULT_HEIGHT = 800;
 
-function createSeed(): number {
+function makeSeed(): number {
   return Math.floor(Math.random() * 2147483647);
 }
 
-function polygonPoints(
-  polygon: [number, number][]
-): string {
-  return polygon
-    .map(([x, y]) => `${x},${y}`)
-    .join(" ");
+function polygonPoints(points: Point[]): string {
+  return points.map(([x, y]) => `${x},${y}`).join(" ");
 }
 
 export default function MapPage() {
-  const [seed, setSeed] = useState(123456);
+  const [mode, setMode] = useState<MapMode>("season");
+  const [userId, setUserId] = useState<string | null>(null);
+
+  const [seasons, setSeasons] = useState<Season[]>([]);
+  const [selectedSeasonId, setSelectedSeasonId] = useState("");
+
+  const [worldSettings, setWorldSettings] =
+    useState<SeasonWorld | null>(null);
+
   const [world, setWorld] = useState<GeneratedWorld | null>(
     null
   );
 
+  const [previewSeed, setPreviewSeed] = useState(123456);
   const [selected, setSelected] =
     useState<GeneratedProvince | null>(null);
 
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
+
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
 
   const dragRef = useRef<{
     x: number;
@@ -61,58 +102,308 @@ export default function MapPage() {
     moved: boolean;
   } | null>(null);
 
+  const selectedSeason =
+    seasons.find((season) => season.id === selectedSeasonId) ??
+    null;
+
+  const isAdmin =
+    !!userId && selectedSeason?.created_by === userId;
+
+  const mapWidth = world?.width ?? DEFAULT_WIDTH;
+  const mapHeight = world?.height ?? DEFAULT_HEIGHT;
+
+  const resetView = useCallback(() => {
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+    setSelected(null);
+    dragRef.current = null;
+  }, []);
+
   useEffect(() => {
+    let active = true;
+
+    async function loadAccount() {
+      const { data, error } = await supabase.auth.getUser();
+
+      if (!active) return;
+
+      if (error || !data.user) {
+        setUserId(null);
+        setLoading(false);
+        setMessage("Please log in to view your season maps.");
+        return;
+      }
+
+      setUserId(data.user.id);
+    }
+
+    void loadAccount();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!userId) return;
+
+    let active = true;
+
+    async function loadSeasons() {
+      setLoading(true);
+
+      const [memberships, seasonResult] = await Promise.all([
+        supabase
+          .from("season_players")
+          .select("season_id")
+          .eq("player_id", userId),
+
+        supabase
+          .from("seasons")
+          .select("id, name, created_by, status")
+          .order("created_at", { ascending: false }),
+      ]);
+
+      if (!active) return;
+
+      if (memberships.error || seasonResult.error) {
+        setMessage(
+          memberships.error?.message ??
+            seasonResult.error?.message ??
+            "Could not load seasons."
+        );
+        setLoading(false);
+        return;
+      }
+
+      const joinedIds = new Set(
+        (memberships.data ?? []).map((row) => row.season_id)
+      );
+
+      const joinedSeasons = (seasonResult.data ?? []).filter(
+        (season) => joinedIds.has(season.id)
+      );
+
+      setSeasons(joinedSeasons);
+
+      setSelectedSeasonId((previous) =>
+        joinedSeasons.some((season) => season.id === previous)
+          ? previous
+          : joinedSeasons[0]?.id ?? ""
+      );
+
+      setLoading(false);
+    }
+
+    void loadSeasons();
+
+    return () => {
+      active = false;
+    };
+  }, [userId]);
+
+  const loadSeasonWorld = useCallback(
+    async (seasonId: string) => {
+      setLoading(true);
+      setMessage("");
+      setWorld(null);
+      setWorldSettings(null);
+      resetView();
+
+      const { data: settings, error: settingsError } =
+        await supabase
+          .from("season_worlds")
+          .select(
+            "season_id, generation_seed, map_width, map_height, is_generated"
+          )
+          .eq("season_id", seasonId)
+          .maybeSingle();
+
+      if (settingsError || !settings) {
+        setMessage(
+          settingsError?.message ??
+            "World settings were not found."
+        );
+        setLoading(false);
+        return;
+      }
+
+      const loadedSettings = settings as SeasonWorld;
+      setWorldSettings(loadedSettings);
+
+      if (!loadedSettings.is_generated) {
+        setLoading(false);
+        return;
+      }
+
+      const { data: provinces, error: provincesError } =
+        await supabase
+          .from("provinces")
+          .select(
+            "province_number, name, terrain, center_x, center_y, polygon"
+          )
+          .eq("season_id", seasonId)
+          .order("province_number", { ascending: true })
+          .limit(300);
+
+      if (provincesError) {
+        setMessage(provincesError.message);
+        setLoading(false);
+        return;
+      }
+
+      const { data: neighborRows, error: neighborError } =
+        await supabase
+          .from("province_neighbors")
+          .select(
+            "province_id, neighbor_id, provinces!province_neighbors_province_id_fkey(province_number)"
+          )
+          .eq("season_id", seasonId)
+          .limit(10000);
+
+      // Province geometry is authoritative. Neighbor information
+      // is reconstructed from the same deterministic generator,
+      // avoiding dependence on foreign-key relationship names.
+      if (neighborError) {
+        console.warn("Neighbor lookup:", neighborError.message);
+      }
+
+      void neighborRows;
+
+      const generated = generateWorld(
+        loadedSettings.generation_seed,
+        loadedSettings.map_width,
+        loadedSettings.map_height,
+        150
+      );
+
+      const neighborsByNumber = new Map(
+        generated.provinces.map((province) => [
+          province.province_number,
+          province.neighbor_numbers,
+        ])
+      );
+
+      const storedProvinces: GeneratedProvince[] = (
+        (provinces ?? []) as DatabaseProvince[]
+      ).map((province) => ({
+        ...province,
+        neighbor_numbers:
+          neighborsByNumber.get(province.province_number) ?? [],
+      }));
+
+      setWorld({
+        width: loadedSettings.map_width,
+        height: loadedSettings.map_height,
+        seed: loadedSettings.generation_seed,
+        provinces: storedProvinces,
+      });
+
+      setLoading(false);
+    },
+    [resetView]
+  );
+
+  useEffect(() => {
+    if (mode !== "season" || !selectedSeasonId) return;
+
+    void loadSeasonWorld(selectedSeasonId);
+  }, [mode, selectedSeasonId, loadSeasonWorld]);
+
+  useEffect(() => {
+    if (mode !== "preview") return;
+
     const generated = generateWorld(
-      seed,
-      MAP_WIDTH,
-      MAP_HEIGHT,
+      previewSeed,
+      DEFAULT_WIDTH,
+      DEFAULT_HEIGHT,
       150
     );
 
     setWorld(generated);
-    setSelected(null);
-    setZoom(1);
-    setOffset({ x: 0, y: 0 });
-  }, [seed]);
+    resetView();
+  }, [mode, previewSeed, resetView]);
 
-  function newWorld() {
-    setSeed(createSeed());
-  }
+  async function generateSeasonMap() {
+    if (
+      !selectedSeasonId ||
+      !worldSettings ||
+      !isAdmin ||
+      selectedSeason?.status !== "open" ||
+      worldSettings.is_generated
+    ) {
+      return;
+    }
 
-  function zoomIn() {
-    setZoom((current) =>
-      Math.min(4, Number((current + 0.25).toFixed(2)))
-    );
-  }
+    setSaving(true);
+    setMessage("");
 
-  function zoomOut() {
-    setZoom((current) =>
-      Math.max(0.75, Number((current - 0.25).toFixed(2)))
-    );
-  }
+    try {
+      const generated = generateWorld(
+        worldSettings.generation_seed,
+        worldSettings.map_width,
+        worldSettings.map_height,
+        150
+      );
 
-  function resetView() {
-    setZoom(1);
-    setOffset({ x: 0, y: 0 });
+      const payload = generated.provinces.map((province) => ({
+        province_number: province.province_number,
+        name: province.name,
+        terrain: province.terrain,
+        center_x: province.center_x,
+        center_y: province.center_y,
+        polygon: province.polygon,
+        neighbor_numbers: province.neighbor_numbers,
+      }));
+
+      const { data, error } = await supabase.rpc(
+        "save_season_world",
+        {
+          p_season_id: selectedSeasonId,
+          p_provinces: payload,
+        }
+      );
+
+      if (error) throw error;
+
+      await loadSeasonWorld(selectedSeasonId);
+
+      setMessage(
+        `World successfully saved! ${data} provinces created.`
+      );
+    } catch (error) {
+      setMessage(
+        error instanceof Error
+          ? `World generation failed: ${error.message}`
+          : "World generation failed."
+      );
+    } finally {
+      setSaving(false);
+    }
   }
 
   function handleWheel(event: WheelEvent<SVGSVGElement>) {
     event.preventDefault();
 
-    const change = event.deltaY < 0 ? 0.15 : -0.15;
-
     setZoom((current) =>
       Math.max(
         0.75,
-        Math.min(4, Number((current + change).toFixed(2)))
+        Math.min(
+          4,
+          Number(
+            (current + (event.deltaY < 0 ? 0.15 : -0.15)).toFixed(2)
+          )
+        )
       )
     );
   }
 
   function handlePointerDown(
-    event: React.PointerEvent<SVGSVGElement>
+    event: ReactPointerEvent<SVGSVGElement>
   ) {
-    if (event.button !== 0) return;
+    if (event.pointerType === "mouse" && event.button !== 0) {
+      return;
+    }
 
     dragRef.current = {
       x: event.clientX,
@@ -127,41 +418,41 @@ export default function MapPage() {
   }
 
   function handlePointerMove(
-    event: React.PointerEvent<SVGSVGElement>
+    event: ReactPointerEvent<SVGSVGElement>
   ) {
     const drag = dragRef.current;
-
     if (!drag) return;
 
     const rect = event.currentTarget.getBoundingClientRect();
 
-    const scaleX = MAP_WIDTH / rect.width;
-    const scaleY = MAP_HEIGHT / rect.height;
+    const dx =
+      ((event.clientX - drag.x) * mapWidth) / rect.width;
 
-    const dx = event.clientX - drag.x;
-    const dy = event.clientY - drag.y;
+    const dy =
+      ((event.clientY - drag.y) * mapHeight) / rect.height;
 
-    if (Math.abs(dx) + Math.abs(dy) > 5) {
+    if (
+      Math.abs(event.clientX - drag.x) +
+        Math.abs(event.clientY - drag.y) >
+      5
+    ) {
       drag.moved = true;
     }
 
     setOffset({
-      x: drag.offsetX + dx * scaleX,
-      y: drag.offsetY + dy * scaleY,
+      x: drag.offsetX + dx,
+      y: drag.offsetY + dy,
     });
   }
 
   function handlePointerUp(
-    event: React.PointerEvent<SVGSVGElement>
+    event: ReactPointerEvent<SVGSVGElement>
   ) {
     setDragging(false);
 
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
-
-    // Keep the drag record briefly for click suppression.
-    // A new pointer down will replace it.
   }
 
   function selectProvince(province: GeneratedProvince) {
@@ -177,56 +468,147 @@ export default function MapPage() {
     <main style={pageStyle}>
       <header style={headerStyle}>
         <div>
-          <div style={eyebrowStyle}>
-            ♛ MEDIEVAL KINGDOMS
-          </div>
-
+          <div style={eyebrowStyle}>♛ MEDIEVAL KINGDOMS</div>
           <h1 style={titleStyle}>World Map</h1>
-
-          <p style={subtitleStyle}>
-            Explore the lands of your future kingdom.
+          <p style={mutedStyle}>
+            Explore the lands of your kingdom.
           </p>
         </div>
 
-        <div style={headerActionsStyle}>
-          <a href="/" style={secondaryButtonStyle}>
-            ← Home
-          </a>
+        <a href="/" style={secondaryButtonStyle}>
+          ← Home
+        </a>
+      </header>
+
+      <div style={modeBarStyle}>
+        <button
+          type="button"
+          onClick={() => setMode("season")}
+          style={
+            mode === "season"
+              ? goldButtonStyle
+              : secondaryButtonStyle
+          }
+        >
+          🏰 Season World
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setMode("preview")}
+          style={
+            mode === "preview"
+              ? goldButtonStyle
+              : secondaryButtonStyle
+          }
+        >
+          🎲 Map Preview
+        </button>
+      </div>
+
+      {mode === "season" && (
+        <section style={seasonPanelStyle}>
+          <h2 style={{ color: "#e0bd79", marginTop: 0 }}>
+            Your Seasons
+          </h2>
+
+          {seasons.length > 0 ? (
+            <>
+              <select
+                value={selectedSeasonId}
+                onChange={(event) =>
+                  setSelectedSeasonId(event.target.value)
+                }
+                style={selectStyle}
+              >
+                {seasons.map((season) => (
+                  <option key={season.id} value={season.id}>
+                    {season.name} ({season.status})
+                  </option>
+                ))}
+              </select>
+
+              {worldSettings && (
+                <div style={{ marginTop: 16 }}>
+                  <p style={mutedStyle}>
+                    World Seed: {worldSettings.generation_seed}
+                  </p>
+
+                  <p style={mutedStyle}>
+                    Status:{" "}
+                    {worldSettings.is_generated
+                      ? "World Generated"
+                      : "Not Generated"}
+                  </p>
+
+                  {isAdmin &&
+                    !worldSettings.is_generated &&
+                    selectedSeason?.status === "open" && (
+                      <button
+                        type="button"
+                        onClick={() => void generateSeasonMap()}
+                        disabled={saving || loading}
+                        style={goldButtonStyle}
+                      >
+                        {saving
+                          ? "Generating World..."
+                          : "🌍 Generate Season World"}
+                      </button>
+                    )}
+
+                  {!isAdmin && !worldSettings.is_generated && (
+                    <p style={mutedStyle}>
+                      Waiting for the season administrator to
+                      generate the world.
+                    </p>
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <p style={mutedStyle}>
+              {loading
+                ? "Loading your seasons..."
+                : "You have not joined any seasons yet."}
+            </p>
+          )}
+        </section>
+      )}
+
+      {mode === "preview" && (
+        <div style={previewBarStyle}>
+          <span>Preview Seed: {previewSeed}</span>
 
           <button
             type="button"
-            onClick={newWorld}
             style={goldButtonStyle}
+            onClick={() => setPreviewSeed(makeSeed())}
           >
             🎲 New World
           </button>
         </div>
-      </header>
+      )}
+
+      {message && (
+        <p role="status" style={messageStyle}>
+          {message}
+        </p>
+      )}
 
       <section style={layoutStyle}>
         <div style={mapPanelStyle}>
           <div style={mapToolbarStyle}>
+            <span>🌍 Fantasy Continent</span>
             <span>
-              🌍 Fantasy Continent
-            </span>
-
-            <span style={{ color: "#cbb78d" }}>
-              Seed: {seed}
+              {world ? `${world.provinces.length} Provinces` : "No Map"}
             </span>
           </div>
 
           <div style={mapViewportStyle}>
             {world ? (
               <svg
-                viewBox={`0 0 ${MAP_WIDTH} ${MAP_HEIGHT}`}
-                style={{
-                  display: "block",
-                  width: "100%",
-                  height: "100%",
-                  cursor: dragging ? "grabbing" : "grab",
-                  touchAction: "none",
-                  userSelect: "none",
-                }}
+                viewBox={`0 0 ${mapWidth} ${mapHeight}`}
+                style={svgStyle}
                 onWheel={handleWheel}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
@@ -248,33 +630,22 @@ export default function MapPage() {
                       strokeWidth="1.5"
                     />
                   </pattern>
-
-                  <filter id="landShadow">
-                    <feDropShadow
-                      dx="0"
-                      dy="3"
-                      stdDeviation="5"
-                      floodColor="#071b22"
-                      floodOpacity="0.55"
-                    />
-                  </filter>
                 </defs>
 
                 <rect
-                  width={MAP_WIDTH}
-                  height={MAP_HEIGHT}
+                  width={mapWidth}
+                  height={mapHeight}
                   fill="#234b5b"
                 />
 
                 <rect
-                  width={MAP_WIDTH}
-                  height={MAP_HEIGHT}
+                  width={mapWidth}
+                  height={mapHeight}
                   fill="url(#seaPattern)"
                 />
 
                 <g
                   transform={`translate(${offset.x} ${offset.y}) scale(${zoom})`}
-                  filter="url(#landShadow)"
                 >
                   {world.provinces.map((province) => {
                     const isSelected =
@@ -285,19 +656,13 @@ export default function MapPage() {
                       <polygon
                         key={province.province_number}
                         points={polygonPoints(province.polygon)}
-                        fill={
-                          TERRAIN_COLORS[province.terrain]
-                        }
+                        fill={COLORS[province.terrain]}
                         stroke={
                           isSelected ? "#ffe4a3" : "#354332"
                         }
-                        strokeWidth={
-                          isSelected ? 3 : 1.15
-                        }
+                        strokeWidth={isSelected ? 3 : 1.15}
                         vectorEffect="non-scaling-stroke"
-                        onClick={() =>
-                          selectProvince(province)
-                        }
+                        onClick={() => selectProvince(province)}
                         style={{
                           cursor: "pointer",
                           opacity: isSelected ? 1 : 0.96,
@@ -306,59 +671,60 @@ export default function MapPage() {
                     );
                   })}
 
-                  {world.provinces.map((province) => {
-                    if (province.polygon.length < 3) {
-                      return null;
-                    }
-
-                    return (
-                      <text
-                        key={`label-${province.province_number}`}
-                        x={province.center_x}
-                        y={province.center_y}
-                        fontSize="9"
-                        textAnchor="middle"
-                        fill="#19251a"
-                        fontFamily="Georgia, serif"
-                        fontWeight="bold"
-                        pointerEvents="none"
-                      >
-                        {province.province_number}
-                      </text>
-                    );
-                  })}
+                  {world.provinces.map((province) => (
+                    <text
+                      key={`label-${province.province_number}`}
+                      x={province.center_x}
+                      y={province.center_y}
+                      fontSize="9"
+                      textAnchor="middle"
+                      fill="#19251a"
+                      fontFamily="Georgia, serif"
+                      fontWeight="bold"
+                      pointerEvents="none"
+                    >
+                      {province.province_number}
+                    </text>
+                  ))}
                 </g>
               </svg>
             ) : (
-              <div style={loadingStyle}>
-                Generating world...
+              <div style={emptyMapStyle}>
+                {loading
+                  ? "Loading world..."
+                  : mode === "season"
+                  ? "The season world has not been generated yet."
+                  : "Generating preview..."}
               </div>
             )}
 
             <div style={zoomControlsStyle}>
               <button
                 type="button"
-                onClick={zoomIn}
                 style={zoomButtonStyle}
-                aria-label="Zoom in"
+                onClick={() =>
+                  setZoom((current) => Math.min(4, current + 0.25))
+                }
               >
                 +
               </button>
 
               <button
                 type="button"
-                onClick={zoomOut}
                 style={zoomButtonStyle}
-                aria-label="Zoom out"
+                onClick={() =>
+                  setZoom((current) =>
+                    Math.max(0.75, current - 0.25)
+                  )
+                }
               >
                 −
               </button>
 
               <button
                 type="button"
-                onClick={resetView}
                 style={zoomButtonStyle}
-                aria-label="Reset map view"
+                onClick={resetView}
               >
                 ⌂
               </button>
@@ -366,26 +732,21 @@ export default function MapPage() {
           </div>
 
           <div style={mapFooterStyle}>
+            <span>Zoom: {Math.round(zoom * 100)}%</span>
             <span>
-              Provinces: {world?.provinces.length ?? 0}
-            </span>
-
-            <span>
-              Zoom: {Math.round(zoom * 100)}%
+              {mode === "season" ? "Saved World" : "Preview"}
             </span>
           </div>
         </div>
 
         <aside style={sidebarStyle}>
-          <div style={sidebarHeadingStyle}>
+          <h2 style={{ color: "#e0bd79", marginTop: 0 }}>
             🏰 Province Information
-          </div>
+          </h2>
 
           {selected ? (
             <>
-              <h2 style={provinceTitleStyle}>
-                {selected.name}
-              </h2>
+              <h3 style={provinceTitleStyle}>{selected.name}</h3>
 
               <p style={mutedStyle}>
                 Province #{selected.province_number}
@@ -423,8 +784,8 @@ export default function MapPage() {
 
                   return (
                     <button
-                      key={number}
                       type="button"
+                      key={number}
                       style={neighborButtonStyle}
                       onClick={() => {
                         if (neighbor) setSelected(neighbor);
@@ -435,45 +796,33 @@ export default function MapPage() {
                   );
                 })}
               </div>
-
-              <p style={hintStyle}>
-                Province ownership, colonization and armies
-                will be added in future steps.
-              </p>
             </>
           ) : (
             <div style={emptySelectionStyle}>
               <div style={{ fontSize: 42 }}>⚔️</div>
-
               <h3>Select a Province</h3>
-
               <p style={mutedStyle}>
-                Click or tap any territory on the map to
-                inspect its terrain and neighboring lands.
+                Click a territory to inspect its terrain and
+                neighboring provinces.
               </p>
             </div>
           )}
 
           <div style={legendStyle}>
-            <h3 style={{ color: "#e0bd79" }}>
-              Map Legend
-            </h3>
+            <h3 style={{ color: "#e0bd79" }}>Map Legend</h3>
 
             {(
-              Object.keys(TERRAIN_COLORS) as Terrain[]
+              Object.keys(COLORS) as Terrain[]
             ).map((terrain) => (
               <div key={terrain} style={legendRowStyle}>
                 <span
                   style={{
                     width: 16,
                     height: 16,
+                    background: COLORS[terrain],
                     borderRadius: 3,
-                    background: TERRAIN_COLORS[terrain],
-                    display: "inline-block",
-                    border: "1px solid #ffffff33",
                   }}
                 />
-
                 <span>{TERRAIN_NAMES[terrain]}</span>
               </div>
             ))}
@@ -482,7 +831,7 @@ export default function MapPage() {
       </section>
 
       <footer style={footerStyle}>
-        MEDIEVAL KINGDOMS · PROCEDURAL WORLD GENERATOR
+        MEDIEVAL KINGDOMS · MULTIPLAYER WORLD MAP
       </footer>
     </main>
   );
@@ -493,7 +842,7 @@ const pageStyle: CSSProperties = {
   background: "#101a16",
   color: "#f4e5c6",
   fontFamily: "Georgia, serif",
-  padding: "24px",
+  padding: 24,
   boxSizing: "border-box",
 };
 
@@ -503,39 +852,33 @@ const headerStyle: CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
   alignItems: "center",
-  flexWrap: "wrap",
   gap: 18,
+  flexWrap: "wrap",
 };
 
 const eyebrowStyle: CSSProperties = {
   color: "#c6a76d",
-  fontSize: 12,
   letterSpacing: 3,
+  fontSize: 12,
 };
 
 const titleStyle: CSSProperties = {
+  color: "#e0bd79",
   fontSize: "clamp(32px, 5vw, 52px)",
   margin: "10px 0",
-  color: "#e0bd79",
 };
 
-const subtitleStyle: CSSProperties = {
+const mutedStyle: CSSProperties = {
   color: "#aab8a8",
-  margin: 0,
-};
-
-const headerActionsStyle: CSSProperties = {
-  display: "flex",
-  gap: 12,
-  flexWrap: "wrap",
+  lineHeight: 1.6,
 };
 
 const goldButtonStyle: CSSProperties = {
   padding: "12px 20px",
-  borderRadius: 6,
   background: "#c6a76d",
   border: "1px solid #e0bd79",
   color: "#171a13",
+  borderRadius: 6,
   fontFamily: "Georgia, serif",
   fontWeight: "bold",
   fontSize: 15,
@@ -544,12 +887,58 @@ const goldButtonStyle: CSSProperties = {
 
 const secondaryButtonStyle: CSSProperties = {
   padding: "12px 20px",
-  borderRadius: 6,
   background: "#1c2c22",
   border: "1px solid #78613b",
   color: "#f4e5c6",
+  borderRadius: 6,
   textDecoration: "none",
+  fontFamily: "Georgia, serif",
   fontSize: 15,
+  cursor: "pointer",
+};
+
+const modeBarStyle: CSSProperties = {
+  maxWidth: 1500,
+  margin: "0 auto 20px",
+  display: "flex",
+  gap: 12,
+  flexWrap: "wrap",
+};
+
+const seasonPanelStyle: CSSProperties = {
+  maxWidth: 1500,
+  margin: "0 auto 20px",
+  padding: 20,
+  background: "#16261f",
+  border: "1px solid #78613b",
+  borderRadius: 10,
+};
+
+const selectStyle: CSSProperties = {
+  width: "100%",
+  maxWidth: 420,
+  padding: 12,
+  background: "#25392b",
+  color: "#f4e5c6",
+  border: "1px solid #78613b",
+  borderRadius: 6,
+  fontSize: 16,
+};
+
+const previewBarStyle: CSSProperties = {
+  maxWidth: 1500,
+  margin: "0 auto 20px",
+  display: "flex",
+  alignItems: "center",
+  gap: 18,
+  flexWrap: "wrap",
+};
+
+const messageStyle: CSSProperties = {
+  maxWidth: 1500,
+  margin: "0 auto 20px",
+  color: "#e0bd79",
+  overflowWrap: "anywhere",
 };
 
 const layoutStyle: CSSProperties = {
@@ -577,7 +966,6 @@ const mapToolbarStyle: CSSProperties = {
   flexWrap: "wrap",
   padding: 16,
   color: "#e0bd79",
-  borderBottom: "1px solid #78613b",
 };
 
 const mapViewportStyle: CSSProperties = {
@@ -589,10 +977,23 @@ const mapViewportStyle: CSSProperties = {
   background: "#234b5b",
 };
 
-const loadingStyle: CSSProperties = {
+const svgStyle: CSSProperties = {
+  display: "block",
+  width: "100%",
+  height: "100%",
+  cursor: "grab",
+  touchAction: "none",
+  userSelect: "none",
+};
+
+const emptyMapStyle: CSSProperties = {
+  height: "100%",
   display: "grid",
   placeItems: "center",
-  height: "100%",
+  textAlign: "center",
+  padding: 20,
+  boxSizing: "border-box",
+  color: "#c6a76d",
 };
 
 const zoomControlsStyle: CSSProperties = {
@@ -630,21 +1031,9 @@ const sidebarStyle: CSSProperties = {
   minWidth: 0,
 };
 
-const sidebarHeadingStyle: CSSProperties = {
-  color: "#c6a76d",
-  fontSize: 13,
-  letterSpacing: 1,
-};
-
 const provinceTitleStyle: CSSProperties = {
-  fontSize: 28,
+  fontSize: 27,
   color: "#e0bd79",
-  marginBottom: 4,
-};
-
-const mutedStyle: CSSProperties = {
-  color: "#aab8a8",
-  lineHeight: 1.6,
 };
 
 const detailRowStyle: CSSProperties = {
@@ -668,7 +1057,6 @@ const neighborButtonStyle: CSSProperties = {
   padding: "8px 10px",
   borderRadius: 5,
   cursor: "pointer",
-  fontFamily: "Georgia, serif",
 };
 
 const emptySelectionStyle: CSSProperties = {
@@ -688,13 +1076,6 @@ const legendRowStyle: CSSProperties = {
   gap: 12,
   marginBottom: 10,
   color: "#d2d8c9",
-};
-
-const hintStyle: CSSProperties = {
-  marginTop: 22,
-  color: "#aab8a8",
-  fontSize: 13,
-  lineHeight: 1.6,
 };
 
 const footerStyle: CSSProperties = {
