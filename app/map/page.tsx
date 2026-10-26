@@ -1,116 +1,96 @@
-width: "100%",
-  aspectRatio: "3 / 2",
-  minHeight: 280,
-  position: "relative",
-  overflow: "hidden",
-  background: "#234b5b",
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  CSSProperties,
+  PointerEvent as ReactPointerEvent,
+  WheelEvent,
+} from "react";
+import { supabase } from "../../lib/supabase";
+import {
+  generateWorld,
+  type GeneratedProvince,
+  type GeneratedWorld,
+  type Point,
+  type Terrain,
+} from "../../lib/worldGenerator";
+
+type Season = {
+  id: string;
+  name: string;
+  created_by: string;
+  status: string;
 };
 
-const svgStyle: CSSProperties = {
-  display: "block",
-  width: "100%",
-  height: "100%",
-  cursor: "grab",
-  touchAction: "none",
-  userSelect: "none",
+type SeasonWorld = {
+  season_id: string;
+  generation_seed: number;
+  map_width: number;
+  map_height: number;
+  is_generated: boolean;
 };
 
-const emptyMapStyle: CSSProperties = {
-  height: "100%",
-  display: "grid",
-  placeItems: "center",
-  textAlign: "center",
-  padding: 20,
-  boxSizing: "border-box",
-  color: "#c6a76d",
+type DatabaseProvince = {
+  province_number: number;
+  name: string;
+  terrain: Terrain;
+  center_x: number;
+  center_y: number;
+  polygon: Point[];
 };
 
-const zoomControlsStyle: CSSProperties = {
-  position: "absolute",
-  right: 14,
-  bottom: 14,
-  display: "grid",
-  gap: 6,
+type MapMode = "season" | "preview";
+
+type DragState = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  offsetX: number;
+  offsetY: number;
+  moved: boolean;
 };
 
-const zoomButtonStyle: CSSProperties = {
-  width: 38,
-  height: 38,
-  background: "#14241be8",
-  border: "1px solid #b99b62",
-  borderRadius: 6,
-  color: "#f4e5c6",
-  fontSize: 23,
-  cursor: "pointer",
+const COLORS: Record<Terrain, string> = {
+  plains: "#a6b87b",
+  forest: "#477b57",
+  hills: "#b4a06c",
+  mountains: "#858a88",
+  swamp: "#647b65",
 };
 
-const mapFooterStyle: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  padding: 14,
-  color: "#aab8a8",
-  fontSize: 13,
+const TERRAIN_NAMES: Record<Terrain, string> = {
+  plains: "Plains",
+  forest: "Forest",
+  hills: "Hills",
+  mountains: "Mountains",
+  swamp: "Swamp",
 };
 
-const sidebarStyle: CSSProperties = {
-  background: "#16261f",
-  border: "1px solid #78613b",
-  borderRadius: 12,
-  padding: 22,
-  minWidth: 0,
-};
+const DEFAULT_WIDTH = 1200;
+const DEFAULT_HEIGHT = 800;
 
-const provinceTitleStyle: CSSProperties = {
-  fontSize: 27,
-  color: "#e0bd79",
-};
+function makeSeed(): number {
+  return Math.floor(Math.random() * 2147483647);
+}
 
-const detailRowStyle: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  gap: 12,
-  padding: "13px 0",
-  borderBottom: "1px solid #ffffff19",
-};
+function polygonPoints(points: Point[]): string {
+  return points.map(([x, y]) => `${x},${y}`).join(" ");
+}
 
-const neighborListStyle: CSSProperties = {
-  display: "flex",
-  flexWrap: "wrap",
-  gap: 8,
-};
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
 
-const neighborButtonStyle: CSSProperties = {
-  background: "#25392b",
-  border: "1px solid #78613b",
-  color: "#e9d6ad",
-  padding: "8px 10px",
-  borderRadius: 5,
-  cursor: "pointer",
-};
+export default function MapPage() {
+  const [mode, setMode] = useState<MapMode>("season");
+  const [userId, setUserId] = useState<string | null>(null);
 
-const emptySelectionStyle: CSSProperties = {
-  textAlign: "center",
-  padding: "35px 5px",
-};
+  const [seasons, setSeasons] = useState<Season[]>([]);
+  const [selectedSeasonId, setSelectedSeasonId] = useState("");
 
-const legendStyle: CSSProperties = {
-  marginTop: 30,
-  borderTop: "1px solid #78613b",
-  paddingTop: 14,
-};
+  const [worldSettings, setWorldSettings] =
+    useState<SeasonWorld | null>(null);
 
-const legendRowStyle: CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: 12,
-  marginBottom: 10,
-  color: "#d2d8c9",
-};
+  const [world, setWorld] = useState<GeneratedWorld | null>(null);
 
-const footerStyle: CSSProperties = {
-  textAlign: "center",
-  color: "#748476",
-  fontSize: 12,
-  marginTop: 35,
-  letterSpacing: 1,
-};
+  const [previewSeed, setPreviewSeed] = useState(123456);
