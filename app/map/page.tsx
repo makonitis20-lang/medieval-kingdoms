@@ -41,6 +41,15 @@ type DatabaseProvince = {
 
 type MapMode = "season" | "preview";
 
+type DragState = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  offsetX: number;
+  offsetY: number;
+  moved: boolean;
+};
+
 const COLORS: Record<Terrain, string> = {
   plains: "#a6b87b",
   forest: "#477b57",
@@ -68,6 +77,10 @@ function polygonPoints(points: Point[]): string {
   return points.map(([x, y]) => `${x},${y}`).join(" ");
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
 export default function MapPage() {
   const [mode, setMode] = useState<MapMode>("season");
   const [userId, setUserId] = useState<string | null>(null);
@@ -78,29 +91,25 @@ export default function MapPage() {
   const [worldSettings, setWorldSettings] =
     useState<SeasonWorld | null>(null);
 
-  const [world, setWorld] = useState<GeneratedWorld | null>(
-    null
-  );
+  const [world, setWorld] = useState<GeneratedWorld | null>(null);
 
   const [previewSeed, setPreviewSeed] = useState(123456);
+
   const [selected, setSelected] =
     useState<GeneratedProvince | null>(null);
 
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
+
   const [dragging, setDragging] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
 
-  const dragRef = useRef<{
-    x: number;
-    y: number;
-    offsetX: number;
-    offsetY: number;
-    moved: boolean;
-  } | null>(null);
+  const dragRef = useRef<DragState | null>(null);
+  const suppressClickRef = useRef(false);
+  const mapRequestRef = useRef(0);
 
   const selectedSeason =
     seasons.find((season) => season.id === selectedSeasonId) ??
@@ -113,10 +122,13 @@ export default function MapPage() {
   const mapHeight = world?.height ?? DEFAULT_HEIGHT;
 
   const resetView = useCallback(() => {
+    dragRef.current = null;
+    suppressClickRef.current = false;
+
+    setDragging(false);
     setZoom(1);
     setOffset({ x: 0, y: 0 });
     setSelected(null);
-    dragRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -172,6 +184,7 @@ export default function MapPage() {
             seasonResult.error?.message ??
             "Could not load seasons."
         );
+
         setLoading(false);
         return;
       }
@@ -204,6 +217,8 @@ export default function MapPage() {
 
   const loadSeasonWorld = useCallback(
     async (seasonId: string) => {
+      const requestId = ++mapRequestRef.current;
+
       setLoading(true);
       setMessage("");
       setWorld(null);
@@ -219,11 +234,14 @@ export default function MapPage() {
           .eq("season_id", seasonId)
           .maybeSingle();
 
+      if (requestId !== mapRequestRef.current) return;
+
       if (settingsError || !settings) {
         setMessage(
           settingsError?.message ??
             "World settings were not found."
         );
+
         setLoading(false);
         return;
       }
@@ -236,60 +254,81 @@ export default function MapPage() {
         return;
       }
 
-      const { data: provinces, error: provincesError } =
-        await supabase
+      const [provinceResult, neighborResult] = await Promise.all([
+        supabase
           .from("provinces")
           .select(
-            "province_number, name, terrain, center_x, center_y, polygon"
+            "id, province_number, name, terrain, center_x, center_y, polygon"
           )
           .eq("season_id", seasonId)
           .order("province_number", { ascending: true })
-          .limit(300);
+          .limit(300),
 
-      if (provincesError) {
-        setMessage(provincesError.message);
+        supabase
+          .from("province_neighbors")
+          .select("province_id, neighbor_id")
+          .eq("season_id", seasonId)
+          .limit(10000),
+      ]);
+
+      if (requestId !== mapRequestRef.current) return;
+
+      if (provinceResult.error) {
+        setMessage(provinceResult.error.message);
         setLoading(false);
         return;
       }
 
-      const { data: neighborRows, error: neighborError } =
-        await supabase
-          .from("province_neighbors")
-          .select(
-            "province_id, neighbor_id, provinces!province_neighbors_province_id_fkey(province_number)"
-          )
-          .eq("season_id", seasonId)
-          .limit(10000);
-
-      // Province geometry is authoritative. Neighbor information
-      // is reconstructed from the same deterministic generator,
-      // avoiding dependence on foreign-key relationship names.
-      if (neighborError) {
-        console.warn("Neighbor lookup:", neighborError.message);
+      if (neighborResult.error) {
+        setMessage(neighborResult.error.message);
+        setLoading(false);
+        return;
       }
 
-      void neighborRows;
+      const provinceRows = provinceResult.data ?? [];
+      const neighborRows = neighborResult.data ?? [];
 
-      const generated = generateWorld(
-        loadedSettings.generation_seed,
-        loadedSettings.map_width,
-        loadedSettings.map_height,
-        150
-      );
+      const numberById = new Map<string, number>();
 
-      const neighborsByNumber = new Map(
-        generated.provinces.map((province) => [
-          province.province_number,
-          province.neighbor_numbers,
-        ])
-      );
+      for (const province of provinceRows) {
+        numberById.set(province.id, province.province_number);
+      }
+
+      const neighborsByNumber = new Map<number, number[]>();
+
+      for (const row of neighborRows) {
+        const provinceNumber = numberById.get(row.province_id);
+        const neighborNumber = numberById.get(row.neighbor_id);
+
+        if (
+          provinceNumber === undefined ||
+          neighborNumber === undefined
+        ) {
+          continue;
+        }
+
+        const neighbors =
+          neighborsByNumber.get(provinceNumber) ?? [];
+
+        if (!neighbors.includes(neighborNumber)) {
+          neighbors.push(neighborNumber);
+        }
+
+        neighborsByNumber.set(provinceNumber, neighbors);
+      }
 
       const storedProvinces: GeneratedProvince[] = (
-        (provinces ?? []) as DatabaseProvince[]
+        provinceRows as DatabaseProvince[]
       ).map((province) => ({
-        ...province,
-        neighbor_numbers:
-          neighborsByNumber.get(province.province_number) ?? [],
+        province_number: province.province_number,
+        name: province.name,
+        terrain: province.terrain,
+        center_x: province.center_x,
+        center_y: province.center_y,
+        polygon: province.polygon,
+        neighbor_numbers: (
+          neighborsByNumber.get(province.province_number) ?? []
+        ).sort((a, b) => a - b),
       }));
 
       setWorld({
@@ -308,10 +347,16 @@ export default function MapPage() {
     if (mode !== "season" || !selectedSeasonId) return;
 
     void loadSeasonWorld(selectedSeasonId);
+
+    return () => {
+      mapRequestRef.current += 1;
+    };
   }, [mode, selectedSeasonId, loadSeasonWorld]);
 
   useEffect(() => {
     if (mode !== "preview") return;
+
+    mapRequestRef.current += 1;
 
     const generated = generateWorld(
       previewSeed,
@@ -321,6 +366,8 @@ export default function MapPage() {
     );
 
     setWorld(generated);
+    setWorldSettings(null);
+    setLoading(false);
     resetView();
   }, [mode, previewSeed, resetView]);
 
@@ -386,14 +433,12 @@ export default function MapPage() {
     event.preventDefault();
 
     setZoom((current) =>
-      Math.max(
+      clamp(
+        Number(
+          (current + (event.deltaY < 0 ? 0.15 : -0.15)).toFixed(2)
+        ),
         0.75,
-        Math.min(
-          4,
-          Number(
-            (current + (event.deltaY < 0 ? 0.15 : -0.15)).toFixed(2)
-          )
-        )
+        4
       )
     );
   }
@@ -406,62 +451,104 @@ export default function MapPage() {
     }
 
     dragRef.current = {
-      x: event.clientX,
-      y: event.clientY,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
       offsetX: offset.x,
       offsetY: offset.y,
       moved: false,
     };
 
+    suppressClickRef.current = false;
     setDragging(true);
-    event.currentTarget.setPointerCapture(event.pointerId);
+
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture may not be available in every browser.
+    }
   }
 
   function handlePointerMove(
     event: ReactPointerEvent<SVGSVGElement>
   ) {
     const drag = dragRef.current;
-    if (!drag) return;
+
+    if (!drag || drag.pointerId !== event.pointerId) return;
+
+    // IMPORTANT:
+    // If the mouse button has been released, stop dragging,
+    // even if the browser missed pointerup.
+    if (event.pointerType === "mouse" && (event.buttons & 1) === 0) {
+      dragRef.current = null;
+      setDragging(false);
+      return;
+    }
 
     const rect = event.currentTarget.getBoundingClientRect();
 
-    const dx =
-      ((event.clientX - drag.x) * mapWidth) / rect.width;
+    if (rect.width === 0 || rect.height === 0) return;
 
-    const dy =
-      ((event.clientY - drag.y) * mapHeight) / rect.height;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
 
-    if (
-      Math.abs(event.clientX - drag.x) +
-        Math.abs(event.clientY - drag.y) >
-      5
-    ) {
+    if (Math.hypot(dx, dy) > 5) {
       drag.moved = true;
+      suppressClickRef.current = true;
     }
 
+    if (!drag.moved) return;
+
+    const mapDx = (dx * mapWidth) / rect.width;
+    const mapDy = (dy * mapHeight) / rect.height;
+
     setOffset({
-      x: drag.offsetX + dx,
-      y: drag.offsetY + dy,
+      x: drag.offsetX + mapDx,
+      y: drag.offsetY + mapDy,
     });
   }
 
-  function handlePointerUp(
+  function finishDragging(
     event: ReactPointerEvent<SVGSVGElement>
   ) {
+    const drag = dragRef.current;
+
+    if (drag && drag.pointerId === event.pointerId) {
+      suppressClickRef.current = drag.moved;
+      dragRef.current = null;
+    }
+
     setDragging(false);
 
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
+    try {
+      if (
+        event.currentTarget.hasPointerCapture(event.pointerId)
+      ) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {
+      // Ignore capture errors.
     }
   }
 
   function selectProvince(province: GeneratedProvince) {
-    if (dragRef.current?.moved) {
-      dragRef.current = null;
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
       return;
     }
 
     setSelected(province);
+  }
+
+  function switchMode(nextMode: MapMode) {
+    if (nextMode === mode) return;
+
+    dragRef.current = null;
+    suppressClickRef.current = false;
+    setDragging(false);
+    setWorld(null);
+    setMessage("");
+    setMode(nextMode);
   }
 
   return (
@@ -469,7 +556,9 @@ export default function MapPage() {
       <header style={headerStyle}>
         <div>
           <div style={eyebrowStyle}>♛ MEDIEVAL KINGDOMS</div>
+
           <h1 style={titleStyle}>World Map</h1>
+
           <p style={mutedStyle}>
             Explore the lands of your kingdom.
           </p>
@@ -483,7 +572,7 @@ export default function MapPage() {
       <div style={modeBarStyle}>
         <button
           type="button"
-          onClick={() => setMode("season")}
+          onClick={() => switchMode("season")}
           style={
             mode === "season"
               ? goldButtonStyle
@@ -495,7 +584,7 @@ export default function MapPage() {
 
         <button
           type="button"
-          onClick={() => setMode("preview")}
+          onClick={() => switchMode("preview")}
           style={
             mode === "preview"
               ? goldButtonStyle
@@ -599,8 +688,11 @@ export default function MapPage() {
         <div style={mapPanelStyle}>
           <div style={mapToolbarStyle}>
             <span>🌍 Fantasy Continent</span>
+
             <span>
-              {world ? `${world.provinces.length} Provinces` : "No Map"}
+              {world
+                ? `${world.provinces.length} Provinces`
+                : "No Map"}
             </span>
           </div>
 
@@ -608,12 +700,21 @@ export default function MapPage() {
             {world ? (
               <svg
                 viewBox={`0 0 ${mapWidth} ${mapHeight}`}
-                style={svgStyle}
+                preserveAspectRatio="xMidYMid meet"
+                style={{
+                  ...svgStyle,
+                  cursor: dragging ? "grabbing" : "grab",
+                }}
                 onWheel={handleWheel}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
-                onPointerUp={handlePointerUp}
-                onPointerCancel={handlePointerUp}
+                onPointerUp={finishDragging}
+                onPointerCancel={finishDragging}
+                onLostPointerCapture={() => {
+                  dragRef.current = null;
+                  setDragging(false);
+                }}
+                onContextMenu={(event) => event.preventDefault()}
               >
                 <defs>
                   <pattern
@@ -703,8 +804,11 @@ export default function MapPage() {
                 type="button"
                 style={zoomButtonStyle}
                 onClick={() =>
-                  setZoom((current) => Math.min(4, current + 0.25))
+                  setZoom((current) =>
+                    clamp(current + 0.25, 0.75, 4)
+                  )
                 }
+                aria-label="Zoom in"
               >
                 +
               </button>
@@ -714,9 +818,10 @@ export default function MapPage() {
                 style={zoomButtonStyle}
                 onClick={() =>
                   setZoom((current) =>
-                    Math.max(0.75, current - 0.25)
+                    clamp(current - 0.25, 0.75, 4)
                   )
                 }
+                aria-label="Zoom out"
               >
                 −
               </button>
@@ -725,6 +830,7 @@ export default function MapPage() {
                 type="button"
                 style={zoomButtonStyle}
                 onClick={resetView}
+                aria-label="Reset map view"
               >
                 ⌂
               </button>
@@ -733,6 +839,7 @@ export default function MapPage() {
 
           <div style={mapFooterStyle}>
             <span>Zoom: {Math.round(zoom * 100)}%</span>
+
             <span>
               {mode === "season" ? "Saved World" : "Preview"}
             </span>
@@ -746,7 +853,9 @@ export default function MapPage() {
 
           {selected ? (
             <>
-              <h3 style={provinceTitleStyle}>{selected.name}</h3>
+              <h3 style={provinceTitleStyle}>
+                {selected.name}
+              </h3>
 
               <p style={mutedStyle}>
                 Province #{selected.province_number}
@@ -800,7 +909,9 @@ export default function MapPage() {
           ) : (
             <div style={emptySelectionStyle}>
               <div style={{ fontSize: 42 }}>⚔️</div>
+
               <h3>Select a Province</h3>
+
               <p style={mutedStyle}>
                 Click a territory to inspect its terrain and
                 neighboring provinces.
@@ -809,7 +920,9 @@ export default function MapPage() {
           )}
 
           <div style={legendStyle}>
-            <h3 style={{ color: "#e0bd79" }}>Map Legend</h3>
+            <h3 style={{ color: "#e0bd79" }}>
+              Map Legend
+            </h3>
 
             {(
               Object.keys(COLORS) as Terrain[]
@@ -821,8 +934,10 @@ export default function MapPage() {
                     height: 16,
                     background: COLORS[terrain],
                     borderRadius: 3,
+                    display: "inline-block",
                   }}
                 />
+
                 <span>{TERRAIN_NAMES[terrain]}</span>
               </div>
             ))}
@@ -946,7 +1061,7 @@ const layoutStyle: CSSProperties = {
   margin: "auto",
   display: "grid",
   gridTemplateColumns:
-    "repeat(auto-fit, minmax(min(100%, 340px), 1fr))",
+    "minmax(0, 3fr) minmax(280px, 1fr)",
   gap: 20,
   alignItems: "start",
 };
