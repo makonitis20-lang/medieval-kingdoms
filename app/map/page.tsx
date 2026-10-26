@@ -1,16 +1,4 @@
-};
-
-const mapToolbarStyle: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  gap: 12,
-  flexWrap: "wrap",
-  padding: 16,
-  color: "#e0bd79",
-};
-
-const mapViewportStyle: CSSProperties = {
-  width: "100%",
+width: "100%",
   aspectRatio: "3 / 2",
   minHeight: 280,
   position: "relative",
